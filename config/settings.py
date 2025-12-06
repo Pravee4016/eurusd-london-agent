@@ -46,6 +46,10 @@ MARKET_OPEN_TIME = "08:00"  # London session open
 ANALYSIS_START_TIME = os.getenv("ANALYSIS_START_TIME", "07:55")  # Pre-session analysis
 MARKET_CLOSE_TIME = "16:00"  # London session close
 
+# Asian Session (Monitoring only, for levels)
+ASIAN_SESSION_START = "00:00"
+ASIAN_SESSION_END = "08:00"
+
 # Timeframes for analysis
 TIMEFRAMES = {
     "5MIN": "5",  # Finnhub uses numeric resolution

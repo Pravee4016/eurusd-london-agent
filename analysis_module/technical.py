@@ -31,7 +31,10 @@ from config.settings import (
     ATR_TP_MULTIPLIER,
     DEBUG_MODE,
     ROUND_NUMBER_LEVELS,
+    ROUND_NUMBER_LEVELS,
     TIME_ZONE,
+    ASIAN_SESSION_START,
+    ASIAN_SESSION_END,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,7 +86,10 @@ class TechnicalLevels:
     pdh: float
     pdl: float
     atr: float
+    atr: float
     volatility_score: float
+    asian_high: float = 0.0
+    asian_low: float = 0.0
 
 
 class TechnicalAnalyzer:
@@ -92,6 +98,67 @@ class TechnicalAnalyzer:
     def __init__(self, instrument: str):
         self.instrument = instrument
         logger.info(f"🔬 TechnicalAnalyzer initialized for {instrument}")
+
+    # =====================================================================
+    # ASIAN RANGE (TOKYO SESSION)
+    # =====================================================================
+
+    def get_asian_range(self, df: pd.DataFrame) -> Optional[Dict]:
+        """
+        Calculate Asian Session High/Low (00:00 - 08:00 GMT).
+        These levels often act as support/resistance during London/NY.
+        """
+        try:
+            import pytz
+            london_tz = pytz.timezone(TIME_ZONE)
+            
+            # Ensure index is datetime
+            df = df.copy()
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index)
+
+            # Convert to London time if not already (assuming input is UTC or London)
+            # Safe check: if no tz, localize to UTC then convert. If tz, convert.
+            if df.index.tz is None:
+                 df.index = df.index.tz_localize("UTC").tz_convert(london_tz)
+            else:
+                 df.index = df.index.tz_convert(london_tz)
+
+            # Get today's data (or the last complete trading day in view)
+            # We want the MOST RECENT completed Asian session relative to the latest data point
+            last_timestamp = df.index[-1]
+            current_day = last_timestamp.date()
+            
+            # Filter for current day's Asian session
+            todays_data = df[df.index.date == current_day]
+            
+            # Parse start/end times
+            start_h, start_m = map(int, ASIAN_SESSION_START.split(":"))
+            end_h, end_m = map(int, ASIAN_SESSION_END.split(":"))
+            
+            asian_data = todays_data.between_time(
+                time(start_h, start_m), 
+                time(end_h, end_m)
+            )
+            
+            if asian_data.empty:
+                # If we are strictly BEFORE Asian session (unlikely in London agent)
+                # or if the data is just missing
+                return None
+                
+            high = float(asian_data["high"].max())
+            low = float(asian_data["low"].min())
+            
+            logger.info(
+                f"🌏 Asian Range ({ASIAN_SESSION_START}-{ASIAN_SESSION_END}) | "
+                f"High: {high:.4f} | Low: {low:.4f}"
+            )
+            
+            return {"high": high, "low": low}
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Asian range calculation failed: {e}")
+            return None
 
     # =====================================================================
     # PDH / PDL
@@ -168,6 +235,17 @@ class TechnicalAnalyzer:
             support_levels = self._find_support_levels(lows)
             resistance_levels = self._find_resistance_levels(highs)
 
+            # Calculate Asian Range
+            asian_range = self.get_asian_range(df)
+            asian_high = asian_range["high"] if asian_range else 0.0
+            asian_low = asian_range["low"] if asian_range else 0.0
+
+            # Include Asian levels in main clusters
+            if asian_high > 0:
+                resistance_levels.append(asian_high)
+            if asian_low > 0:
+                support_levels.append(asian_low)
+
             support_clusters = self._cluster_levels(support_levels)
             resistance_clusters = self._cluster_levels(resistance_levels)
 
@@ -201,11 +279,13 @@ class TechnicalAnalyzer:
                 pdl=pdl or 0.0,
                 atr=atr,
                 volatility_score=volatility_score,
+                asian_high=asian_high,
+                asian_low=asian_low,
             )
 
         except Exception as e:
             logger.error(f"❌ S/R calculation failed: {str(e)}")
-            return TechnicalLevels([], [], 0.0, 0.0, 0.0, 0.0, 0.0)
+            return TechnicalLevels([], [], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
     def _find_support_levels(self, lows: np.ndarray) -> List[float]:
         """Identify support levels via local minima."""
@@ -1112,8 +1192,8 @@ class TechnicalAnalyzer:
             )
 
             for level in candidate_levels:
-                distance_pct = abs(current_price - level) / level * 100.0
-                if distance_pct <= RETEST_ZONE_PERCENT:
+                distance_pips = abs(current_price - level) * 10000
+                if distance_pips <= RETEST_ZONE_PIPS:
                     
                     # ====================
                     # Determine Role Reversal
@@ -1168,7 +1248,7 @@ class TechnicalAnalyzer:
                     logger.info(
                         f"🎯 RETEST SETUP | {description} | "
                         f"Price: {current_price:.2f} | Level: {level:.2f} | "
-                        f"Dist: {distance_pct:.3f}%"
+                        f"Dist: {distance_pips:.1f} pips"
                     )
 
                     atr = support_resistance.atr
@@ -1239,7 +1319,7 @@ class TechnicalAnalyzer:
                         timestamp=pd.Timestamp.now(),
                         description=description,
                         debug_info={
-                            "distance_pct": distance_pct,
+                            "distance_pips": distance_pips,
                             "broke_above": broke_above,
                             "broke_below": broke_below,
                             "price_above_level": price_above_level,
@@ -1831,16 +1911,16 @@ class TechnicalAnalyzer:
                 support_level = None
                 
                 for level in support_resistance.support_levels[:3]:
-                    distance_pct = abs(current_low - level) / level * 100
-                    if distance_pct <= 0.5:  # Within 0.5% of support
+                    distance_pips = abs(current_low - level) * 10000
+                    if distance_pips <= RETEST_ZONE_PIPS:  # Near support
                         at_support = True
                         support_level = level
                         break
                 
                 # Also check if near PDL
                 if not at_support and support_resistance.pdl > 0:
-                    distance_pct = abs(current_low - support_resistance.pdl) / support_resistance.pdl * 100
-                    if distance_pct <= 0.5:
+                    distance_pips = abs(current_low - support_resistance.pdl) * 10000
+                    if distance_pips <= RETEST_ZONE_PIPS:
                         at_support = True
                         support_level = support_resistance.pdl
 
@@ -1920,16 +2000,16 @@ class TechnicalAnalyzer:
                 resistance_level = None
                 
                 for level in support_resistance.resistance_levels[:3]:
-                    distance_pct = abs(current_high - level) / level * 100
-                    if distance_pct <= 0.5:  # Within 0.5% of resistance
+                    distance_pips = abs(current_high - level) * 10000
+                    if distance_pips <= RETEST_ZONE_PIPS:  # Near resistance
                         at_resistance = True
                         resistance_level = level
                         break
                 
                 # Also check if near PDH
                 if not at_resistance and support_resistance.pdh > 0:
-                    distance_pct = abs(current_high - support_resistance.pdh) / support_resistance.pdh * 100
-                    if distance_pct <= 0.5:
+                    distance_pips = abs(current_high - support_resistance.pdh) * 10000
+                    if distance_pips <= RETEST_ZONE_PIPS:
                         at_resistance = True
                         resistance_level = support_resistance.pdh
 
@@ -2079,15 +2159,15 @@ class TechnicalAnalyzer:
                 support_level = None
                 
                 for level in support_resistance.support_levels[:3]:
-                    distance_pct = abs(curr_low - level) / level * 100
-                    if distance_pct <= 0.5:
+                    distance_pips = abs(curr_low - level) * 10000
+                    if distance_pips <= RETEST_ZONE_PIPS:
                         at_support = True
                         support_level = level
                         break
                 
                 if not at_support and support_resistance.pdl > 0:
-                    distance_pct = abs(curr_low - support_resistance.pdl) / support_resistance.pdl * 100
-                    if distance_pct <= 0.5:
+                    distance_pips = abs(curr_low - support_resistance.pdl) * 10000
+                    if distance_pips <= RETEST_ZONE_PIPS:
                         at_support = True
                         support_level = support_resistance.pdl
 
@@ -2180,15 +2260,15 @@ class TechnicalAnalyzer:
                 resistance_level = None
                 
                 for level in support_resistance.resistance_levels[:3]:
-                    distance_pct = abs(curr_high - level) / level * 100
-                    if distance_pct <= 0.5:
+                    distance_pips = abs(curr_high - level) * 10000
+                    if distance_pips <= RETEST_ZONE_PIPS:
                         at_resistance = True
                         resistance_level = level
                         break
                 
                 if not at_resistance and support_resistance.pdh > 0:
-                    distance_pct = abs(curr_high - support_resistance.pdh) / support_resistance.pdh * 100
-                    if distance_pct <= 0.5:
+                    distance_pips = abs(curr_high - support_resistance.pdh) * 10000
+                    if distance_pips <= RETEST_ZONE_PIPS:
                         at_resistance = True
                         resistance_level = support_resistance.pdh
 
