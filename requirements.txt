@@ -1,0 +1,31 @@
+# Core
+pandas>=2.0.3
+numpy>=1.24.3
+python-dateutil==2.8.2
+pytz==2023.3
+python-dotenv
+
+# HTTP / API
+requests==2.31.0
+flask>=3.0.0
+gunicorn>=21.2.0
+
+# Config
+python-dotenv==1.0.0
+
+# Market data
+finnhub-python>=2.4.0
+yfinance>=0.2.40
+
+# Scheduling (optional for local scheduler)
+APScheduler==3.10.4
+
+# Telegram
+python-telegram-bot==20.3
+
+# Timezone helpers
+tzdata==2023.3
+google-cloud-firestore
+
+# AI / LLM
+groq>=0.4.0

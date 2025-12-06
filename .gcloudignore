@@ -1,0 +1,22 @@
+# Exclude venv
+venv/
+__pycache__/
+*.pyc
+
+# Exclude editor files
+.vscode/
+.idea/
+
+# Exclude Google SDK downloaded to project (you should NOT keep it here)
+google-cloud-sdk/
+
+# Exclude logs
+*.log
+logs/
+
+# Exclude tar archives
+*.tar.gz
+*.zip
+
+# Exclude system junk
+.DS_Store
