@@ -217,6 +217,10 @@ MAX_ALERTS_PER_INSTRUMENT = int(os.getenv("MAX_ALERTS_PER_INSTRUMENT", "15"))  #
 MIN_ATR_PERCENT = float(os.getenv("MIN_ATR_PERCENT", "0.2"))  # 0.2% = ~22 pips at 1.10
 MAX_VWAP_CROSSES = int(os.getenv("MAX_VWAP_CROSSES", "4"))  # Max crosses in 10 bars = choppy
 
+# Velocity Breaker (Flash Crash Protection)
+# 0.2% per minute is extreme for EUR/USD (approx 20 pips/min)
+MAX_1MIN_MOVE_PCT = float(os.getenv("MAX_1MIN_MOVE_PCT", "0.2"))
+
 # Correlation Limits
 MAX_SAME_DIRECTION_ALERTS = int(os.getenv("MAX_SAME_DIRECTION_ALERTS", "3"))  # Max similar directional trades in 15 mins
 

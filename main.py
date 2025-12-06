@@ -27,6 +27,7 @@ from ai_module.groq_analyzer import get_analyzer
 from telegram_module.bot_handler import get_bot
 from data_module.persistence import get_persistence
 from data_module.trade_tracker import get_trade_tracker
+from analysis_module.manipulation_guard import CircuitBreaker
 
 # ------------------------------------------------------
 # Market Hours Check (moved to cloud_function_handler)
@@ -69,6 +70,7 @@ class NiftyTradingAgent:
         self.telegram_bot = get_bot()
         self.persistence = get_persistence()
         self.trade_tracker = get_trade_tracker()
+        self.circuit_breaker = CircuitBreaker()
         
         self.signals_generated: List[Dict] = []
         self.alerts_sent = 0
@@ -130,7 +132,29 @@ class NiftyTradingAgent:
                 logger.info(f"\n🔍 Analyzing: {instrument}")
                 logger.info("-" * 70)
 
-                instrument_result = self._analyze_single_instrument(instrument)
+                # Fetch real-time price first for Circuit Breaker
+                forex_data = self.fetcher.fetch_forex_data(instrument) or {}
+                current_price = forex_data.get("last_price", 0)
+
+                # ===========================
+                # 1. VELOCITY BREAKER CHECK
+                # ===========================
+                # We need fresh 5m data for velocity check
+                df_5m_integrity = self.fetcher.fetch_historical_data(
+                     instrument, resolution="5", days_back=1
+                )
+                if df_5m_integrity is not None and not df_5m_integrity.empty:
+                     df_5m_integrity = self.fetcher.preprocess_ohlcv(df_5m_integrity)
+                     is_safe, reason = self.circuit_breaker.check_market_integrity(
+                          df_5m_integrity, current_price, instrument
+                     )
+                     if not is_safe:
+                          logger.warning(f"⛔ MARKET UNSAFE: {reason}. Skipping analysis.")
+                          results["errors"] += 1
+                          results["details"][instrument] = {"error": reason}
+                          continue
+
+                instrument_result = self._analyze_single_instrument(instrument, forex_data)
                 results["details"][instrument] = instrument_result
 
                 if instrument_result["success"]:
@@ -154,7 +178,7 @@ class NiftyTradingAgent:
         self._print_analysis_summary(results)
         return results
 
-    def _analyze_single_instrument(self, instrument: str) -> Dict:
+    def _analyze_single_instrument(self, instrument: str, forex_data: Dict = None) -> Dict:
         """Analyze single instrument with 5m + 15m data and MTF filters."""
         result = {
             "instrument": instrument,
@@ -166,9 +190,10 @@ class NiftyTradingAgent:
         }
 
         try:
-            logger.debug("Step 1: Fetching real-time forex data...")
-            forex_data = self.fetcher.fetch_forex_data(instrument)
-
+            logger.debug("Step 1: Checking forex data...")
+            if not forex_data:
+                 forex_data = self.fetcher.fetch_forex_data(instrument)
+            
             if not forex_data:
                 logger.warning("⚠️  Forex data fetch failed")
                 forex_data = {}  # Empty dict as fallback
@@ -676,6 +701,8 @@ class NiftyTradingAgent:
                 trade_id = self.trade_tracker.record_alert(signal)
                 if trade_id:
                     logger.info(f"   📝 Trade tracked: {trade_id}")
+                else:
+                    logger.warning("   ⚠️ Failed to track trade")
                 
                 # Record this alert to prevent duplicates
                 self.recent_alerts[alert_key] = now

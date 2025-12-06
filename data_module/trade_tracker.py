@@ -1,17 +1,18 @@
 """
 Trade Tracker Module
 Tracks individual trade alerts and their outcomes in Firestore.
+Isolated for EUR/USD Agent.
 """
 
 import logging
 import os
 import uuid
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import Dict, Optional
 import pytz
 
 from google.cloud import firestore
-from config.settings import TIME_ZONE
+from config.settings import TIME_ZONE, FIRESTORE_COLLECTION_TRADES
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ class TradeTracker:
     
     def __init__(self):
         self.db = None
-        self.collection_name = "trades"
+        self.collection_name = FIRESTORE_COLLECTION_TRADES  # Uses eurusd_trades from settings
         self.project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
         
         if not self.project_id:
@@ -59,6 +60,7 @@ class TradeTracker:
                 "confidence": signal.get("confidence"),
                 "risk_reward": signal.get("risk_reward_ratio"),
                 "description": signal.get("description"),
+                "atr": signal.get("atr", 0.0),
                 "status": "OPEN",  # OPEN, WIN, LOSS, BREAKEVEN
                 "filters": signal.get("debug_info", {}),
                 "outcome": None
@@ -72,40 +74,9 @@ class TradeTracker:
             logger.error(f"❌ Failed to record trade: {str(e)}")
             return None
 
-    def update_outcome(self, trade_id: str, outcome: Dict) -> bool:
-        """
-        Update trade outcome.
-        outcome = {
-            "status": "WIN" | "LOSS" | "BREAKEVEN",
-            "exit_price": float,
-            "pnl_points": float,
-            "duration_mins": float
-        }
-        """
-        if not self.db:
-            return False
-
-        try:
-            doc_ref = self.db.collection(self.collection_name).document(trade_id)
-            doc_ref.update({
-                "status": outcome.get("status"),
-                "outcome": outcome,
-                "closed_at": firestore.SERVER_TIMESTAMP
-            })
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to update trade outcome: {str(e)}")
-            return False
-
     def check_open_trades(self, current_prices: Dict[str, float]) -> int:
         """
         Check all open trades and automatically close them if TP or SL is hit.
-        
-        Args:
-            current_prices: Dict of {instrument: current_price}
-            
-        Returns:
-            Number of trades closed
         """
         if not self.db:
             return 0
@@ -130,43 +101,67 @@ class TradeTracker:
                 signal_type = trade.get("signal_type", "")
                 opened_at = trade.get("timestamp")
                 
-                # Skip if we don't have current price for this instrument
-                if instrument not in current_prices:
+                # Check based on instrument symbol or common name
+                # EurUsd agent might use "EUR/USD" or "EURUSD"
+                price = None
+                if instrument in current_prices:
+                    price = current_prices[instrument]
+                elif "EUR" in instrument and "EURUSD" in current_prices:
+                    price = current_prices["EURUSD"]
+                
+                if price is None:
                     continue
                 
-                current_price = current_prices[instrument]
+                current_price = price
                 
                 # Determine if LONG or SHORT
                 is_long = "BULLISH" in signal_type or "SUPPORT" in signal_type or "LONG" in signal_type
+                atr = trade.get("atr", 0.0)
+                
+                # ===========================
+                # ATR TRAILING STOP LOGIC
+                # ===========================
+                trailing_mult = 1.5
+                
+                if atr > 0:
+                    if is_long:
+                        potential_sl = current_price - (atr * trailing_mult)
+                        if potential_sl > sl:
+                            logger.info(f"🔄 Trailing SL updated: {sl:.4f} -> {potential_sl:.4f}")
+                            sl = potential_sl
+                            doc.reference.update({"stop_loss": sl})
+                    else:
+                        potential_sl = current_price + (atr * trailing_mult)
+                        if potential_sl < sl:
+                            logger.info(f"🔄 Trailing SL updated: {sl:.4f} -> {potential_sl:.4f}")
+                            sl = potential_sl
+                            doc.reference.update({"stop_loss": sl})
                 
                 outcome = None
                 exit_price = None
                 
                 # Check if TP or SL hit
                 if is_long:
-                    # LONG trade
                     if current_price >= tp:
-                        # Target hit - WIN
                         outcome = "WIN"
                         exit_price = tp
                     elif current_price <= sl:
-                        # Stop loss hit - LOSS
                         outcome = "LOSS"
                         exit_price = sl
                 else:
-                    # SHORT trade
                     if current_price <= tp:
-                        # Target hit - WIN
                         outcome = "WIN"
                         exit_price = tp
                     elif current_price >= sl:
-                        # Stop loss hit - LOSS
                         outcome = "LOSS"
                         exit_price = sl
                 
                 # Update trade if outcome determined
                 if outcome:
-                    pnl_points = abs(exit_price - entry) if outcome == "WIN" else -abs(exit_price - entry)
+                    if outcome == "WIN":
+                         pnl_points = abs(exit_price - entry) * 10000 # Pips
+                    else:
+                         pnl_points = -abs(exit_price - entry) * 10000 # Pips
                     
                     # Calculate duration
                     duration_mins = (now - opened_at).total_seconds() / 60.0 if opened_at else 0
@@ -174,13 +169,12 @@ class TradeTracker:
                     outcome_data = {
                         "status": outcome,
                         "exit_price": exit_price,
-                        "pnl_points": pnl_points,
+                        "pnl_pips": pnl_points,
                         "duration_mins": duration_mins,
                         "closed_by": "AUTO"
                     }
                     
                     # Update in Firestore
-                    doc_ref = self.db.collection(self.collection_name).document(trade_id)
                     doc_ref.update({
                         "status": outcome,
                         "outcome": outcome_data,
@@ -189,8 +183,8 @@ class TradeTracker:
                     
                     closed_count += 1
                     logger.info(
-                        f"✅ Trade auto-closed: {instrument} {signal_type} | "
-                        f"{outcome} @ {exit_price:.2f} | P&L: {pnl_points:.2f}"
+                        f"✅ Trade auto-closed: {signal_type} | "
+                        f"{outcome} @ {exit_price:.4f} | P&L: {pnl_points:.1f} pips"
                     )
             
             return closed_count
@@ -198,61 +192,6 @@ class TradeTracker:
         except Exception as e:
             logger.error(f"❌ Failed to check open trades: {str(e)}")
             return 0
-
-    def get_stats(self, days: int = 7) -> Dict:
-        """
-        Calculate performance stats for the last N days.
-        """
-        if not self.db:
-            return {}
-
-        try:
-            # Calculate start date
-            start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-            
-            # Query trades
-            trades_ref = self.db.collection(self.collection_name)
-            query = trades_ref.where("date", ">=", start_date).stream()
-            
-            total_alerts = 0
-            wins = 0
-            losses = 0
-            by_type = {}
-            
-            for doc in query:
-                trade = doc.to_dict()
-                total_alerts += 1
-                
-                stype = trade.get("signal_type", "UNKNOWN")
-                status = trade.get("status", "OPEN")
-                
-                # Stats by type
-                if stype not in by_type:
-                    by_type[stype] = {"count": 0, "wins": 0, "losses": 0}
-                
-                by_type[stype]["count"] += 1
-                
-                if status == "WIN":
-                    wins += 1
-                    by_type[stype]["wins"] += 1
-                elif status == "LOSS":
-                    losses += 1
-                    by_type[stype]["losses"] += 1
-            
-            win_rate = (wins / (wins + losses)) * 100 if (wins + losses) > 0 else 0
-            
-            return {
-                "period_days": days,
-                "total_alerts": total_alerts,
-                "wins": wins,
-                "losses": losses,
-                "win_rate": win_rate,
-                "by_type": by_type
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to get stats: {str(e)}")
-            return {}
 
 # Singleton
 _tracker = None
